@@ -1,0 +1,26 @@
+{
+  "name": "cretee-telegram-bot",
+  "version": "3.0.0",
+  "description": "Telegram Multi-Account Group Manager - Full Version",
+  "main": "index.js",
+  "scripts": {
+    "start": "node index.js",
+    "dev": "nodemon index.js",
+    "render-build": "npm install"
+  },
+  "dependencies": {
+    "telegraf": "^4.16.3",
+    "express": "^4.18.2",
+    "mongoose": "^8.0.0",
+    "telegram": "^2.15.13",
+    "input": "^1.0.1",
+    "crypto-js": "^4.1.1",
+    "dotenv": "^16.3.1",
+    "async": "^3.2.4",
+    "winston": "^3.11.0",
+    "node-cron": "^3.0.3"
+  },
+  "engines": {
+    "node": ">=18.0.0"
+  }
+}

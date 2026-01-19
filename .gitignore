@@ -1,0 +1,26 @@
+# Dependencies
+node_modules/
+
+# Environment variables
+.env
+.env.*
+
+# Telegram sessions
+sessions/
+*.session
+
+# Logs
+logs/
+*.log
+
+# System files
+.DS_Store
+Thumbs.db
+
+# Editor files
+.vscode/
+.idea/
+
+# Temporary files
+temp/
+tmp/

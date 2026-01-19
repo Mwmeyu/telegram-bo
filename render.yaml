@@ -1,0 +1,16 @@
+services:
+  - type: web
+    name: cretee-bot
+    env: node
+    buildCommand: npm install
+    startCommand: npm start
+    envVars:
+      - key: BOT_TOKEN
+        sync: false
+      - key: MONGODB_URI
+        sync: false
+      - key: ENCRYPTION_KEY
+        sync: false
+    healthCheckPath: /health
+    autoDeploy: true
+    plan: free
