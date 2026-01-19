@@ -1,920 +1,1605 @@
-const { Telegraf, Markup } = require('telegraf');
-const express = require('express');
-const mongoose = require('mongoose');
+const { Telegraf, session, Scenes: { Stage, BaseScene }, Markup } = require('telegraf');
+const { Sequelize, DataTypes } = require('sequelize');
+const { TelegramClient } = require('telegram');
+const { StringSession } = require('telegram/sessions');
+const input = require('input');
 const crypto = require('crypto');
-const fs = require('fs').promises;
 const path = require('path');
-require('dotenv').config();
+const fs = require('fs').promises;
+const os = require('os');
+const winston = require('winston');
+const AsyncLock = require('async-lock');
 
-// Create necessary directories
-const createDirectories = async () => {
-  const dirs = ['sessions', 'logs'];
-  for (const dir of dirs) {
-    try {
-      await fs.mkdir(dir, { recursive: true });
-    } catch (err) {
-      // Directory already exists
-    }
+// Setup logging
+const logger = winston.createLogger({
+  level: 'info',
+  format: winston.format.combine(
+    winston.format.timestamp(),
+    winston.format.printf(({ timestamp, level, message }) => {
+      return `${timestamp} [${level.toUpperCase()}]: ${message}`;
+    })
+  ),
+  transports: [
+    new winston.transports.Console(),
+    new winston.transports.File({ filename: 'bot.log' })
+  ]
+});
+
+// Database setup
+const sequelize = new Sequelize({
+  dialect: 'sqlite',
+  storage: 'bot_database.db',
+  logging: false,
+  retry: {
+    max: 5,
+    timeout: 30000
   }
-};
-
-// Initialize
-const bot = new Telegraf(process.env.BOT_TOKEN);
-const app = express();
-app.use(express.json());
-
-// ========== DATABASE MODELS ==========
-const UserSchema = new mongoose.Schema({
-  telegramId: { type: Number, required: true, unique: true },
-  username: String,
-  firstName: String,
-  lastName: String,
-  isPremium: { type: Boolean, default: false },
-  subscriptionExpiry: Date,
-  apiLimit: { type: Number, default: 3 },
-  createdAt: { type: Date, default: Date.now },
-  lastActive: { type: Date, default: Date.now }
 });
 
-const AccountSchema = new mongoose.Schema({
-  phone: { type: String, required: true, unique: true },
-  apiId: { type: String, required: true },
-  apiHash: { type: String, required: true },
-  sessionString: { type: String, required: true },
-  isActive: { type: Boolean, default: true },
-  isBanned: { type: Boolean, default: false },
-  ownerUserId: { type: Number, required: true },
-  ownerUsername: String,
-  has2FA: { type: Boolean, default: false },
-  createdAt: { type: Date, default: Date.now },
-  lastUsed: { type: Date, default: Date.now }
-});
-
-const GroupSchema = new mongoose.Schema({
-  groupName: String,
-  chatId: String,
-  inviteLink: String,
-  createdByAccount: String,
-  createdByUser: Number,
-  createdAt: { type: Date, default: Date.now },
-  memberCount: { type: Number, default: 1 },
-  isActive: { type: Boolean, default: true }
-});
-
-const User = mongoose.model('User', UserSchema);
-const Account = mongoose.model('Account', AccountSchema);
-const Group = mongoose.model('Group', GroupSchema);
-
-// ========== ENCRYPTION ==========
-class Encryption {
-  static encrypt(text) {
-    const key = process.env.ENCRYPTION_KEY || 'default-key-32-chars-long-here!!';
-    const iv = crypto.randomBytes(16);
-    const cipher = crypto.createCipheriv('aes-256-gcm', Buffer.from(key.padEnd(32, '0').slice(0, 32)), iv);
-    let encrypted = cipher.update(text, 'utf8', 'hex');
-    encrypted += cipher.final('hex');
-    const authTag = cipher.getAuthTag();
-    return `${iv.toString('hex')}:${encrypted}:${authTag.toString('hex')}`;
+// Models
+const UserAccount = sequelize.define('UserAccount', {
+  id: {
+    type: DataTypes.INTEGER,
+    primaryKey: true,
+    autoIncrement: true
+  },
+  phone: {
+    type: DataTypes.STRING,
+    unique: true,
+    allowNull: false
+  },
+  api_id: {
+    type: DataTypes.STRING,
+    allowNull: false
+  },
+  api_hash: {
+    type: DataTypes.STRING,
+    allowNull: false
+  },
+  is_active: {
+    type: DataTypes.BOOLEAN,
+    defaultValue: true
+  },
+  session_file: {
+    type: DataTypes.STRING
+  },
+  session_string: {
+    type: DataTypes.TEXT
+  },
+  created_at: {
+    type: DataTypes.DATE,
+    defaultValue: DataTypes.NOW
+  },
+  last_used: {
+    type: DataTypes.DATE,
+    defaultValue: DataTypes.NOW
+  },
+  is_banned: {
+    type: DataTypes.BOOLEAN,
+    defaultValue: false
+  },
+  owner_user_id: {
+    type: DataTypes.BIGINT,
+    allowNull: false,
+    defaultValue: 0
+  },
+  owner_username: {
+    type: DataTypes.STRING
   }
+}, {
+  tableName: 'user_accounts',
+  indexes: [
+    { fields: ['owner_user_id'] },
+    { fields: ['phone'] },
+    { fields: ['is_active'] }
+  ]
+});
 
-  static decrypt(text) {
-    const key = process.env.ENCRYPTION_KEY || 'default-key-32-chars-long-here!!';
-    const [ivHex, encryptedHex, authTagHex] = text.split(':');
-    const iv = Buffer.from(ivHex, 'hex');
-    const encrypted = Buffer.from(encryptedHex, 'hex');
-    const authTag = Buffer.from(authTagHex, 'hex');
-    const decipher = crypto.createDecipheriv('aes-256-gcm', Buffer.from(key.padEnd(32, '0').slice(0, 32)), iv);
-    decipher.setAuthTag(authTag);
-    let decrypted = decipher.update(encrypted, 'hex', 'utf8');
-    decrypted += decipher.final('utf8');
-    return decrypted;
+const CreatedGroup = sequelize.define('CreatedGroup', {
+  id: {
+    type: DataTypes.INTEGER,
+    primaryKey: true,
+    autoIncrement: true
+  },
+  group_name: {
+    type: DataTypes.STRING
+  },
+  chat_id: {
+    type: DataTypes.STRING
+  },
+  invite_link: {
+    type: DataTypes.STRING
+  },
+  created_by_account: {
+    type: DataTypes.STRING
+  },
+  created_by_user: {
+    type: DataTypes.BIGINT
+  },
+  created_at: {
+    type: DataTypes.DATE,
+    defaultValue: DataTypes.NOW
+  },
+  member_count: {
+    type: DataTypes.INTEGER,
+    defaultValue: 0
+  },
+  is_active: {
+    type: DataTypes.BOOLEAN,
+    defaultValue: true
+  }
+}, {
+  tableName: 'created_groups',
+  indexes: [
+    { fields: ['created_by_user'] }
+  ]
+});
+
+// Initialize database
+async function initDatabase() {
+  try {
+    await sequelize.sync();
+    logger.info('✅ Database initialized successfully');
+  } catch (error) {
+    logger.error('❌ Database initialization failed:', error);
+    throw error;
   }
 }
 
-// ========== SIMPLIFIED TELEGRAM SERVICE ==========
-class TelegramService {
-  constructor(apiId, apiHash, phone) {
-    this.apiId = parseInt(apiId);
-    this.apiHash = apiHash;
+// Bot token from environment variable
+const BOT_TOKEN = process.env.BOT_TOKEN || '7558633348:AAFE8w35Egwot45wUX2eVunfBUeMdlfg0Rs';
+
+// Admin configuration
+const ADMIN_USERNAMES = ['mwmeyu'];
+const ADMIN_USER_IDS = new Set();
+
+// User sessions management
+const userSessions = new Map();
+const sessionLock = new AsyncLock();
+
+// Group name templates
+const GROUP_NAME_TEMPLATES = [
+  'Global Chat {number}',
+  'Friends Zone {number}',
+  'Discussion Hub {number}',
+  'Chat Group {number}',
+  'Community {number}',
+  'Talk Room {number}',
+  'Connect {number}',
+  'Social Hub {number}',
+  'Network {number}',
+  'Unity {number}'
+];
+
+// Helper functions
+function isAdmin(userId, username = null) {
+  if (ADMIN_USER_IDS.has(userId)) return true;
+  if (username && ADMIN_USERNAMES.includes(username.toLowerCase())) return true;
+  return false;
+}
+
+function getUsernameFromCtx(ctx) {
+  return ctx.from?.username || null;
+}
+
+function generateGroupName() {
+  const template = GROUP_NAME_TEMPLATES[Math.floor(Math.random() * GROUP_NAME_TEMPLATES.length)];
+  const number = Math.floor(1000 + Math.random() * 9000);
+  return template.replace('{number}', number);
+}
+
+async function getUserSession(userId) {
+  return new Promise((resolve) => {
+    sessionLock.acquire(userId.toString(), () => {
+      resolve(userSessions.get(userId) || {});
+    });
+  });
+}
+
+async function setUserSession(userId, key, value) {
+  return new Promise((resolve) => {
+    sessionLock.acquire(userId.toString(), () => {
+      if (!userSessions.has(userId)) {
+        userSessions.set(userId, {});
+      }
+      userSessions.get(userId)[key] = value;
+      resolve();
+    });
+  });
+}
+
+async function clearUserSession(userId) {
+  return new Promise((resolve) => {
+    sessionLock.acquire(userId.toString(), () => {
+      userSessions.delete(userId);
+      resolve();
+    });
+  });
+}
+
+// Telegram User Account Manager
+class UserAccountManager {
+  constructor(phone, apiId, apiHash) {
     this.phone = phone;
+    this.api_id = apiId;
+    this.api_hash = apiHash;
+    this.session_string = null;
     this.client = null;
+    this.is_connected = false;
   }
 
-  async connect(sessionString = '') {
-    try {
-      const { TelegramClient } = await import('telegram');
-      const { StringSession } = await import('telegram/sessions');
-      
-      this.stringSession = new StringSession(sessionString);
-      this.client = new TelegramClient(this.stringSession, this.apiId, this.apiHash, {
-        connectionRetries: 3,
-      });
+  async connect() {
+    if (!this.is_connected) {
+      const stringSession = new StringSession(this.session_string || '');
+      this.client = new TelegramClient(
+        stringSession,
+        parseInt(this.api_id),
+        this.api_hash,
+        {
+          connectionRetries: 5,
+          timeout: 30,
+          autoReconnect: true
+        }
+      );
       
       await this.client.connect();
-      return true;
-    } catch (error) {
-      console.error('Connection error:', error.message);
-      return false;
+      this.is_connected = true;
     }
   }
 
   async disconnect() {
-    if (this.client) {
+    if (this.is_connected && this.client) {
       await this.client.disconnect();
+      this.is_connected = false;
     }
   }
 
   async sendCode() {
     try {
-      if (!this.client) {
-        const connected = await this.connect();
-        if (!connected) return false;
-      }
-      
-      await this.client.sendCode({
-        apiId: this.apiId,
-        apiHash: this.apiHash,
+      await this.connect();
+      const result = await this.client.sendCode({
+        apiId: parseInt(this.api_id),
+        apiHash: this.api_hash,
       }, this.phone);
-      return true;
+      return { success: true, phoneCodeHash: result.phoneCodeHash };
     } catch (error) {
-      console.error('Send code error:', error.message);
-      return false;
+      logger.error('Failed to send code:', error);
+      return { success: false, error: error.message };
     }
   }
 
-  async signIn(code) {
+  async signIn(code, phoneCodeHash) {
     try {
-      await this.client.signIn({
+      const result = await this.client.signIn({
         phoneNumber: this.phone,
         phoneCode: code,
+        phoneCodeHash: phoneCodeHash
       });
-      return true;
+      
+      // Save session string
+      this.session_string = this.client.session.save();
+      return { success: true, session: this.session_string };
     } catch (error) {
-      if (error.message?.includes('SESSION_PASSWORD_NEEDED') || error.errorMessage === 'SESSION_PASSWORD_NEEDED') {
-        return '2FA_NEEDED';
+      if (error.errorMessage === 'SESSION_PASSWORD_NEEDED') {
+        return { success: false, requires2FA: true };
       }
-      throw error;
+      logger.error('Sign in failed:', error);
+      return { success: false, error: error.message };
     }
   }
 
   async signInWithPassword(password) {
     try {
       await this.client.signIn({
-        password: password,
+        password: password
       });
-      return true;
-    } catch (error) {
-      throw error;
-    }
-  }
-
-  async getSessionString() {
-    if (this.client && this.client.session) {
-      return this.client.session.save();
-    }
-    return '';
-  }
-}
-
-// ========== SESSION MANAGEMENT ==========
-const userSessions = new Map();
-const ADMIN_USERNAMES = ["mwmeyu"];
-const ADMIN_USER_IDS = [];
-
-function isAdmin(userId, username) {
-  if (ADMIN_USER_IDS.includes(userId)) return true;
-  if (username && ADMIN_USERNAMES.includes(username.toLowerCase())) {
-    if (!ADMIN_USER_IDS.includes(userId)) ADMIN_USER_IDS.push(userId);
-    return true;
-  }
-  return false;
-}
-
-// Group name templates
-const GROUP_NAME_TEMPLATES = [
-  "Global Chat",
-  "Friends Zone",
-  "Discussion Hub",
-  "Chat Group",
-  "Community",
-  "Talk Room",
-  "Connect",
-  "Social Hub",
-  "Network",
-  "Unity"
-];
-
-function generateGroupName() {
-  const template = GROUP_NAME_TEMPLATES[Math.floor(Math.random() * GROUP_NAME_TEMPLATES.length)];
-  const number = Math.floor(1000 + Math.random() * 9000);
-  return `${template} ${number}`;
-}
-
-// ========== BOT COMMANDS ==========
-
-// Start command
-bot.command('start', async (ctx) => {
-  const user = ctx.from;
-  const userId = user.id;
-  
-  try {
-    // Register or find user
-    let userDoc = await User.findOne({ telegramId: userId });
-    if (!userDoc) {
-      userDoc = new User({
-        telegramId: userId,
-        username: user.username,
-        firstName: user.first_name,
-        lastName: user.last_name
-      });
-      await userDoc.save();
-    }
-    
-    userDoc.lastActive = new Date();
-    await userDoc.save();
-    
-    const admin = isAdmin(userId, user.username);
-    const accountCount = await Account.countDocuments({ ownerUserId: userId, isActive: true, isBanned: false });
-    const groupCount = await Group.countDocuments({ createdByUser: userId, isActive: true });
-    
-    const buttons = [
-      [Markup.button.callback('➕ Add Account', 'add_account')],
-      [Markup.button.callback('👥 Create Group', 'create_group')],
-      [Markup.button.callback('📱 My Accounts', 'list_accounts')],
-      [Markup.button.callback('📊 Stats', 'show_stats')]
-    ];
-    
-    if (admin) {
-      buttons.push([Markup.button.callback('👑 Admin Panel', 'admin_panel')]);
-    }
-    
-    const keyboard = Markup.inlineKeyboard(buttons);
-    
-    await ctx.reply(`
-🤖 <b>Cretee Bot - Full Version</b>
-
-Welcome, ${user.first_name}! I'm your 24/7 Telegram group manager.
-
-📋 <b>Features:</b>
-• Multiple account support
-• Group creation
-• 24/7 uptime
-
-👤 <b>Your Stats:</b>
-📱 Accounts: ${accountCount}
-👥 Groups Created: ${groupCount}
-${admin ? '👑 Role: Admin' : '💎 Plan: Standard'}
-
-Use buttons or commands below:
-/addaccount - Add Telegram account
-/creategroup - Create single group
-/listaccounts - List your accounts
-/status - Check bot status
-${admin ? '/admin - Admin panel' : ''}
-    `, {
-      parse_mode: 'HTML',
-      ...keyboard
-    });
-  } catch (error) {
-    console.error('Start command error:', error);
-    await ctx.reply('❌ An error occurred. Please try again.');
-  }
-});
-
-// Add account command
-bot.command('addaccount', async (ctx) => {
-  const userId = ctx.from.id;
-  
-  const userDoc = await User.findOne({ telegramId: userId });
-  const maxAccounts = userDoc?.isPremium ? 10 : 3;
-  const accountCount = await Account.countDocuments({ ownerUserId: userId, isActive: true, isBanned: false });
-  
-  if (accountCount >= maxAccounts) {
-    return ctx.reply(`
-❌ Account limit reached!
-
-You have ${accountCount}/${maxAccounts} accounts.
-
-💎 Upgrade to premium for more accounts.
-    `);
-  }
-  
-  userSessions.set(userId, {
-    state: 'WAITING_API',
-    data: {}
-  });
-  
-  await ctx.reply(`
-📱 <b>Add Real Telegram Account</b>
-
-To add your account:
-
-1. Go to <a href="https://my.telegram.org">my.telegram.org</a>
-2. Login with your phone number
-3. Go to "API Development Tools"
-4. Create new application
-5. Send me in this format:
-
-<code>api_id api_hash phone_number</code>
-
-Example: <code>123456 1a2b3c4d5e6f +1234567890</code>
-  `, {
-    parse_mode: 'HTML',
-    disable_web_page_preview: true
-  });
-});
-
-// Handle API credentials input
-bot.on('text', async (ctx) => {
-  const userId = ctx.from.id;
-  const userSession = userSessions.get(userId);
-  
-  if (!userSession) return;
-  
-  const text = ctx.message.text.trim();
-  
-  if (userSession.state === 'WAITING_API') {
-    const parts = text.split(/\s+/);
-    
-    if (parts.length < 3) {
-      return ctx.reply('❌ Invalid format. Send: api_id api_hash phone_number');
-    }
-    
-    const [apiId, apiHash, phone] = parts;
-    
-    // Validate phone
-    if (!/^\+[1-9]\d{1,14}$/.test(phone)) {
-      return ctx.reply('❌ Invalid phone format. Use: +1234567890');
-    }
-    
-    // Check if phone already exists
-    const existing = await Account.findOne({ phone });
-    if (existing) {
-      return ctx.reply(`❌ Phone ${phone} already exists. Use different number.`);
-    }
-    
-    userSession.state = 'WAITING_CODE';
-    userSession.data = { apiId, apiHash, phone };
-    userSessions.set(userId, userSession);
-    
-    try {
-      const telegramService = new TelegramService(apiId, apiHash, phone);
-      const sent = await telegramService.sendCode();
       
-      if (sent) {
-        userSession.telegramService = telegramService;
-        await ctx.reply('✅ Code sent! Enter the 5-digit verification code:');
+      // Save session string
+      this.session_string = this.client.session.save();
+      return { success: true, session: this.session_string };
+    } catch (error) {
+      logger.error('2FA sign in failed:', error);
+      return { success: false, error: error.message };
+    }
+  }
+
+  async createGroupWithFeatures(groupName, options = {}) {
+    const {
+      welcomeMessageText = 'hello',
+      chatHistoryVisible = true,
+      sendWelcomeMessage = true,
+      openAllPermissions = true,
+      members = []
+    } = options;
+
+    try {
+      await this.connect();
+
+      // Create the group/channel
+      const result = await this.client.invoke({
+        _: 'channels.createChannel',
+        title: groupName,
+        about: '',
+        megagroup: true,
+        broadcast: false
+      });
+
+      const channel = result.chats[0];
+
+      // Make chat history visible if requested
+      if (chatHistoryVisible) {
+        try {
+          await this.client.invoke({
+            _: 'channels.togglePreHistoryHidden',
+            channel: channel,
+            enabled: false
+          });
+        } catch (error) {
+          logger.warning('Could not set chat history visible:', error.message);
+        }
+      }
+
+      // Open all permissions if requested
+      if (openAllPermissions) {
+        try {
+          const defaultBannedRights = {
+            _: 'chatBannedRights',
+            until_date: 0,
+            view_messages: false,
+            send_messages: false,
+            send_media: false,
+            send_stickers: false,
+            send_gifs: false,
+            send_games: false,
+            send_inline: false,
+            embed_links: false,
+            send_polls: false,
+            change_info: false,
+            invite_users: false,
+            pin_messages: false
+          };
+
+          await this.client.invoke({
+            _: 'messages.editChatDefaultBannedRights',
+            peer: channel,
+            banned_rights: defaultBannedRights
+          });
+        } catch (error) {
+          logger.warning('Could not open all permissions:', error.message);
+        }
+      }
+
+      // Generate invite link
+      const invite = await this.client.invoke({
+        _: 'messages.exportChatInvite',
+        peer: channel
+      });
+
+      // Send welcome message if requested
+      if (sendWelcomeMessage) {
+        try {
+          await this.client.sendMessage(channel, {
+            message: welcomeMessageText
+          });
+        } catch (error) {
+          logger.warning('Could not send welcome message:', error.message);
+        }
+      }
+
+      // Add members if provided
+      let addedMembers = 0;
+      for (const username of members) {
+        try {
+          const user = await this.client.getEntity(username);
+          await this.client.invoke({
+            _: 'channels.inviteToChannel',
+            channel: channel,
+            users: [user]
+          });
+          addedMembers++;
+          await new Promise(resolve => setTimeout(resolve, 1000));
+        } catch (error) {
+          logger.error(`Failed to add ${username}:`, error.message);
+        }
+      }
+
+      return {
+        success: true,
+        chat_id: channel.id.toString(),
+        invite_link: invite.link,
+        title: channel.title,
+        members_added: addedMembers,
+        total_members: addedMembers + 1
+      };
+    } catch (error) {
+      logger.error('Error creating group:', error);
+      return {
+        success: false,
+        error: error.message
+      };
+    }
+  }
+
+  async getSelfCreatedGroups() {
+    try {
+      await this.connect();
+      const dialogs = await this.client.getDialogs({});
+      
+      const selfCreatedGroups = [];
+      
+      for (const dialog of dialogs) {
+        try {
+          const entity = dialog.entity;
+          
+          // Skip private chats
+          if (!entity || dialog.isUser) continue;
+          
+          // Check if it's a group/channel
+          const isGroup = entity.megagroup || entity._ === 'chat' || entity._ === 'channel';
+          if (!isGroup) continue;
+          
+          // Check if user is the creator
+          let isCreator = false;
+          
+          if (entity.creator) {
+            isCreator = true;
+          } else {
+            try {
+              const participant = await this.client.getParticipant(entity, await this.client.getMe());
+              if (participant && participant.isCreator) {
+                isCreator = true;
+              }
+            } catch (e) {
+              // Skip if we can't get participant info
+            }
+          }
+          
+          if (isCreator) {
+            selfCreatedGroups.push({
+              id: entity.id,
+              title: entity.title,
+              username: entity.username || null
+            });
+          }
+        } catch (error) {
+          logger.error('Error processing dialog:', error);
+        }
+      }
+      
+      return selfCreatedGroups;
+    } catch (error) {
+      logger.error('Error getting self-created groups:', error);
+      return [];
+    }
+  }
+
+  async sendMessageToGroups(groups, messageText) {
+    const results = [];
+    
+    for (const group of groups) {
+      try {
+        await this.client.sendMessage(group.id, {
+          message: messageText
+        });
+        results.push({
+          group_id: group.id,
+          title: group.title,
+          success: true
+        });
+        
+        // Wait 1 second between messages to avoid rate limits
+        await new Promise(resolve => setTimeout(resolve, 1000));
+      } catch (error) {
+        results.push({
+          group_id: group.id,
+          title: group.title,
+          success: false,
+          error: error.message
+        });
+      }
+    }
+    
+    return results;
+  }
+}
+
+// Create bot scenes
+const addAccountScene = new BaseScene('addAccount');
+const createBulkScene = new BaseScene('createBulk');
+const createSingleScene = new BaseScene('createSingle');
+const createMultiScene = new BaseScene('createMulti');
+const sendMessageScene = new BaseScene('sendMessage');
+
+// Add Account Scene
+addAccountScene.enter(async (ctx) => {
+  await clearUserSession(ctx.from.id);
+  await setUserSession(ctx.from.id, 'step', 'api_id');
+  
+  await ctx.reply(
+    '📋 **Add Telegram User Account**\n\n' +
+    '1. Go to https://my.telegram.org\n' +
+    '2. Login with your phone number\n' +
+    '3. Create an app to get API credentials\n\n' +
+    'Please send your **API ID**:'
+  );
+});
+
+addAccountScene.on('text', async (ctx) => {
+  const userId = ctx.from.id;
+  const session = await getUserSession(userId);
+  const step = session.step;
+  const text = ctx.message.text.trim();
+
+  switch (step) {
+    case 'api_id':
+      if (!/^\d+$/.test(text)) {
+        await ctx.reply('❌ API ID must be a number. Try again:');
+        return;
+      }
+      await setUserSession(userId, 'api_id', text);
+      await setUserSession(userId, 'step', 'api_hash');
+      await ctx.reply('✅ Got API ID. Now send your **API HASH**:');
+      break;
+
+    case 'api_hash':
+      if (text.length < 10) {
+        await ctx.reply('❌ Invalid API Hash. Try again:');
+        return;
+      }
+      await setUserSession(userId, 'api_hash', text);
+      await setUserSession(userId, 'step', 'phone');
+      await ctx.reply(
+        '✅ Got API Hash.\n\n' +
+        'Now send your **Phone Number** in international format:\n' +
+        'Example: +1234567890'
+      );
+      break;
+
+    case 'phone':
+      if (!/^\+[1-9]\d{1,14}$/.test(text)) {
+        await ctx.reply(
+          '❌ Invalid phone format. Use international format: +1234567890\n' +
+          'Try again:'
+        );
+        return;
+      }
+
+      // Check if phone already exists
+      const existingAccount = await UserAccount.findOne({ where: { phone: text } });
+      if (existingAccount) {
+        if (existingAccount.owner_user_id === userId || isAdmin(userId, getUsernameFromCtx(ctx))) {
+          await ctx.reply(
+            `✅ Phone number ${text} already exists in your accounts.\n` +
+            'You can use it directly.'
+          );
+          return ctx.scene.leave();
+        } else {
+          await ctx.reply(
+            `❌ Phone number ${text} already exists in database.\n` +
+            'Use a different phone number.'
+          );
+          return ctx.scene.leave();
+        }
+      }
+
+      await setUserSession(userId, 'phone', text);
+      
+      const sessionData = await getUserSession(userId);
+      if (!sessionData.api_id || !sessionData.api_hash) {
+        await ctx.reply('❌ Session expired. Start again with /addaccount');
+        return ctx.scene.leave();
+      }
+
+      // Initialize UserAccountManager and send code
+      const account = new UserAccountManager(
+        text,
+        sessionData.api_id,
+        sessionData.api_hash
+      );
+
+      const codeResult = await account.sendCode();
+      if (codeResult.success) {
+        await setUserSession(userId, 'account', account);
+        await setUserSession(userId, 'phoneCodeHash', codeResult.phoneCodeHash);
+        await setUserSession(userId, 'step', 'code');
+        
+        await ctx.reply(
+          '✅ Code sent to your Telegram app!\n\n' +
+          'Please send the **verification code** you received:'
+        );
       } else {
         await ctx.reply('❌ Failed to send code. Check phone number.');
-        userSessions.delete(userId);
+        return ctx.scene.leave();
       }
-    } catch (error) {
-      await ctx.reply(`❌ Error: ${error.message}`);
-      userSessions.delete(userId);
-    }
-  }
-  
-  else if (userSession.state === 'WAITING_CODE') {
-    if (!/^\d{5}$/.test(text)) {
-      return ctx.reply('❌ Invalid code. Enter 5-digit code:');
-    }
-    
-    try {
-      const telegramService = userSession.telegramService;
-      const result = await telegramService.signIn(text);
-      
-      if (result === true) {
-        const sessionString = await telegramService.getSessionString();
-        
-        // Save account to database
-        const account = new Account({
-          phone: userSession.data.phone,
-          apiId: userSession.data.apiId,
-          apiHash: userSession.data.apiHash,
-          sessionString: Encryption.encrypt(sessionString),
-          ownerUserId: userId,
-          ownerUsername: ctx.from.username,
-          isActive: true
-        });
-        
-        await account.save();
-        await telegramService.disconnect();
-        
-        // Clear session
-        userSessions.delete(userId);
-        
-        await ctx.reply(`
-✅ <b>Account added successfully!</b>
+      break;
 
-Account: ${userSession.data.phone}
-Use /creategroup to start creating groups.
-        `, { parse_mode: 'HTML' });
-        
-      } else if (result === '2FA_NEEDED') {
-        userSession.state = 'WAITING_PASSWORD';
-        await ctx.reply('🔐 Account has 2FA. Enter your password:');
+    case 'code':
+      if (!/^\d{5}$/.test(text)) {
+        await ctx.reply('❌ Invalid code format. Send 5-digit code:');
+        return;
+      }
+
+      const userSession = await getUserSession(userId);
+      if (!userSession.account || !userSession.phoneCodeHash) {
+        await ctx.reply('❌ Session expired. Start again.');
+        return ctx.scene.leave();
+      }
+
+      const signInResult = await userSession.account.signIn(text, userSession.phoneCodeHash);
+      
+      if (signInResult.success) {
+        // Save account to database
+        const newAccount = await UserAccount.create({
+          phone: userSession.phone,
+          api_id: userSession.api_id,
+          api_hash: userSession.api_hash,
+          session_string: signInResult.session,
+          is_active: true,
+          owner_user_id: userId,
+          owner_username: getUsernameFromCtx(ctx)
+        });
+
+        await clearUserSession(userId);
+        await ctx.reply(
+          '✅ **Account added successfully!**\n\n' +
+          'This account can now create groups.\n' +
+          'Use /creategroup to start.'
+        );
+        return ctx.scene.leave();
+      } else if (signInResult.requires2FA) {
+        await setUserSession(userId, 'step', 'password');
+        await ctx.reply(
+          '🔐 **Two-Factor Authentication Enabled**\n\n' +
+          'Please send your 2FA password:'
+        );
       } else {
         await ctx.reply('❌ Invalid code. Try /addaccount again.');
-        userSessions.delete(userId);
+        return ctx.scene.leave();
       }
-    } catch (error) {
-      await ctx.reply(`❌ Error: ${error.message}`);
-      userSessions.delete(userId);
-    }
-  }
-  
-  else if (userSession.state === 'WAITING_PASSWORD') {
-    try {
-      const telegramService = userSession.telegramService;
-      const success = await telegramService.signInWithPassword(text);
-      
-      if (success) {
-        const sessionString = await telegramService.getSessionString();
-        
-        // Save account to database
-        const account = new Account({
-          phone: userSession.data.phone,
-          apiId: userSession.data.apiId,
-          apiHash: userSession.data.apiHash,
-          sessionString: Encryption.encrypt(sessionString),
-          ownerUserId: userId,
-          ownerUsername: ctx.from.username,
-          isActive: true,
-          has2FA: true
-        });
-        
-        await account.save();
-        await telegramService.disconnect();
-        
-        // Clear session
-        userSessions.delete(userId);
-        
-        await ctx.reply(`
-✅ <b>Account added with 2FA!</b>
+      break;
 
-Account: ${userSession.data.phone}
-Use /creategroup to start.
-        `, { parse_mode: 'HTML' });
+    case 'password':
+      const sessionData2 = await getUserSession(userId);
+      if (!sessionData2.account) {
+        await ctx.reply('❌ Session expired. Start again.');
+        return ctx.scene.leave();
+      }
+
+      const passwordResult = await sessionData2.account.signInWithPassword(text);
+      
+      if (passwordResult.success) {
+        // Save account to database
+        const newAccount = await UserAccount.create({
+          phone: sessionData2.phone,
+          api_id: sessionData2.api_id,
+          api_hash: sessionData2.api_hash,
+          session_string: passwordResult.session,
+          is_active: true,
+          owner_user_id: userId,
+          owner_username: getUsernameFromCtx(ctx)
+        });
+
+        await clearUserSession(userId);
+        await ctx.reply(
+          '✅ **Account added successfully with 2FA!**\n\n' +
+          'Use /creategroup to start creating groups.'
+        );
+        return ctx.scene.leave();
       } else {
         await ctx.reply('❌ Invalid password. Try /addaccount again.');
-        userSessions.delete(userId);
+        return ctx.scene.leave();
       }
-    } catch (error) {
-      await ctx.reply(`❌ Error: ${error.message}`);
-      userSessions.delete(userId);
-    }
+      break;
   }
 });
 
-// Create group command - SIMPLIFIED FOR NOW
-bot.command('creategroup', async (ctx) => {
-  await ctx.reply(`
-🚧 <b>Feature Under Development</b>
+addAccountScene.command('cancel', async (ctx) => {
+  await clearUserSession(ctx.from.id);
+  await ctx.reply('❌ Operation cancelled.');
+  return ctx.scene.leave();
+});
 
-Group creation feature is being updated.
-Please check back soon!
+// Create Single Group Scene
+createSingleScene.enter(async (ctx) => {
+  const userId = ctx.from.id;
+  const username = getUsernameFromCtx(ctx);
+  
+  let accounts;
+  if (isAdmin(userId, username)) {
+    accounts = await UserAccount.findAll({
+      where: { is_active: true, is_banned: false }
+    });
+  } else {
+    accounts = await UserAccount.findAll({
+      where: { owner_user_id: userId, is_active: true, is_banned: false }
+    });
+  }
 
-For now, you can:
-1. Add accounts with /addaccount
-2. List accounts with /listaccounts
-  `, { parse_mode: 'HTML' });
+  if (!accounts.length) {
+    await ctx.reply(
+      '❌ No active accounts found.\n' +
+      'Use /addaccount to add a Telegram user account first.'
+    );
+    return ctx.scene.leave();
+  }
+
+  await setUserSession(userId, 'accounts', accounts);
+  await setUserSession(userId, 'mode', 'single');
+
+  const keyboard = accounts.map((acc, i) => [
+    Markup.button.callback(
+      `${i + 1}. ${acc.phone}${isAdmin(acc.owner_user_id, acc.owner_username) ? ' 👑' : ''}`,
+      `select_acc_${i}`
+    )
+  ]);
+
+  keyboard.push([Markup.button.callback('❌ Cancel', 'cancel_selection')]);
+
+  const adminNote = isAdmin(userId, username) ? ' (All accounts - Admin View)' : '';
+  
+  await ctx.reply(
+    `📱 **Select Account for Group Creation**${adminNote}\n\n` +
+    `Available accounts (${accounts.length}):`,
+    Markup.inlineKeyboard(keyboard)
+  );
+});
+
+createSingleScene.action(/select_acc_(\d+)/, async (ctx) => {
+  await ctx.answerCbQuery();
+  
+  const userId = ctx.from.id;
+  const username = getUsernameFromCtx(ctx);
+  const accIndex = parseInt(ctx.match[1]);
+  
+  const session = await getUserSession(userId);
+  const accounts = session.accounts || [];
+  
+  if (accIndex >= accounts.length) {
+    await ctx.editMessageText('❌ Invalid account selection.');
+    return ctx.scene.leave();
+  }
+  
+  const selectedAccount = accounts[accIndex];
+  
+  // Check ownership for non-admin users
+  if (!isAdmin(userId, username) && selectedAccount.owner_user_id !== userId) {
+    await ctx.editMessageText('❌ You don\'t have permission to use this account.');
+    return ctx.scene.leave();
+  }
+  
+  await setUserSession(userId, 'selected_account', selectedAccount);
+  
+  const groupName = generateGroupName();
+  
+  await ctx.editMessageText(
+    `✅ Selected account: **${selectedAccount.phone}**\n\n` +
+    `Creating group with auto-generated name...`
+  );
+  
+  // Create the group
+  try {
+    const account = new UserAccountManager(
+      selectedAccount.phone,
+      selectedAccount.api_id,
+      selectedAccount.api_hash
+    );
+    account.session_string = selectedAccount.session_string;
+    
+    const result = await account.createGroupWithFeatures(groupName);
+    
+    if (result.success) {
+      // Update last used
+      await selectedAccount.update({ last_used: new Date() });
+      
+      const keyboard = [
+        [Markup.button.url('🔗 Open Group', result.invite_link)],
+        [Markup.button.callback('📋 Copy Link', `copy_${result.invite_link}`)],
+        [
+          Markup.button.callback('📱 List Accounts', 'list_accounts'),
+          Markup.button.callback('🚀 Create Another', 'create_another')
+        ],
+        [Markup.button.callback('🏠 Main Menu', 'main_menu')]
+      ];
+      
+      await ctx.editMessageText(
+        `✅ **Group Created Successfully!**\n\n` +
+        `**Name:** ${groupName}\n` +
+        `**ID:** ${result.chat_id}\n` +
+        `**Account:** ${selectedAccount.phone}\n` +
+        `**Features:**\n` +
+        `• ✅ 'hello' message sent\n` +
+        `• ✅ All permissions open\n` +
+        `• ✅ Chat history visible\n\n` +
+        `What would you like to do next?`,
+        Markup.inlineKeyboard(keyboard)
+      );
+    } else {
+      await ctx.editMessageText(`❌ Failed to create group: ${result.error || 'Unknown error'}`);
+    }
+    
+    await account.disconnect();
+  } catch (error) {
+    logger.error('Error creating single group:', error);
+    await ctx.editMessageText(`❌ Error creating group: ${error.message}`);
+  }
+  
+  return ctx.scene.leave();
+});
+
+createSingleScene.action('cancel_selection', async (ctx) => {
+  await ctx.answerCbQuery();
+  await ctx.editMessageText('❌ Operation cancelled.');
+  return ctx.scene.leave();
+});
+
+// Send Message Scene
+sendMessageScene.enter(async (ctx) => {
+  await ctx.reply(
+    '📤 **Send Message to Your Self-Created Groups**\n\n' +
+    'This feature will send a message to all groups/channels ' +
+    'where you are the **CREATOR** (not just admin).\n\n' +
+    '**Important:** Only sends to groups you created yourself.\n\n' +
+    '**Please choose account type:**',
+    Markup.inlineKeyboard([
+      [Markup.button.callback('📱 Single Account', 'msg_single')],
+      [Markup.button.callback('📱📱 Multiple Accounts', 'msg_multi')],
+      [Markup.button.callback('❌ Cancel', 'cancel_selection')]
+    ])
+  );
+});
+
+sendMessageScene.action('msg_single', async (ctx) => {
+  await ctx.answerCbQuery();
+  await ctx.editMessageText('📱 **Select Account for Message Sending**\n\nChoose which account to use:');
+  
+  const userId = ctx.from.id;
+  const username = getUsernameFromCtx(ctx);
+  
+  let accounts;
+  if (isAdmin(userId, username)) {
+    accounts = await UserAccount.findAll({
+      where: { is_active: true, is_banned: false }
+    });
+  } else {
+    accounts = await UserAccount.findAll({
+      where: { owner_user_id: userId, is_active: true, is_banned: false }
+    });
+  }
+  
+  if (!accounts.length) {
+    await ctx.editMessageText('❌ No active accounts found.');
+    return ctx.scene.leave();
+  }
+  
+  await setUserSession(userId, 'msg_mode', 'single');
+  await setUserSession(userId, 'accounts', accounts);
+  await setUserSession(userId, 'selected_msg_accounts', []);
+  
+  const keyboard = accounts.map((acc, i) => [
+    Markup.button.callback(
+      `${i + 1}. ${acc.phone}${isAdmin(acc.owner_user_id, acc.owner_username) ? ' 👑' : ''}`,
+      `msg_acc_${i}`
+    )
+  ]);
+  
+  keyboard.push([Markup.button.callback('❌ Cancel', 'cancel_selection')]);
+  
+  const adminNote = isAdmin(userId, username) ? ' (All accounts - Admin View)' : '';
+  
+  await ctx.editMessageText(
+    `📱 **Select Account for Message Sending**${adminNote}\n\n` +
+    `Available accounts (${accounts.length}):`,
+    Markup.inlineKeyboard(keyboard)
+  );
+});
+
+sendMessageScene.action(/msg_acc_(\d+)/, async (ctx) => {
+  await ctx.answerCbQuery();
+  
+  const userId = ctx.from.id;
+  const username = getUsernameFromCtx(ctx);
+  const accIndex = parseInt(ctx.match[1]);
+  
+  const session = await getUserSession(userId);
+  const accounts = session.accounts || [];
+  
+  if (accIndex >= accounts.length) {
+    await ctx.editMessageText('❌ Invalid account selection.');
+    return ctx.scene.leave();
+  }
+  
+  const selectedAccount = accounts[accIndex];
+  
+  // Check ownership for non-admin users
+  if (!isAdmin(userId, username) && selectedAccount.owner_user_id !== userId) {
+    await ctx.editMessageText('❌ You don\'t have permission to use this account.');
+    return ctx.scene.leave();
+  }
+  
+  await setUserSession(userId, 'selected_msg_accounts', [selectedAccount]);
+  
+  await ctx.editMessageText(
+    `✅ Selected account: **${selectedAccount.phone}**\n\n` +
+    `Now send the **message text** you want to send to all self-created groups:`
+  );
+  
+  // Set state to wait for message text
+  await setUserSession(userId, 'step', 'get_message_text');
+});
+
+sendMessageScene.on('text', async (ctx) => {
+  const userId = ctx.from.id;
+  const session = await getUserSession(userId);
+  
+  if (session.step === 'get_message_text') {
+    const messageText = ctx.message.text.trim();
+    
+    if (!messageText) {
+      await ctx.reply('❌ Message cannot be empty. Try again:');
+      return;
+    }
+    
+    const selectedAccounts = session.selected_msg_accounts || [];
+    
+    if (!selectedAccounts.length) {
+      await ctx.reply('❌ No accounts selected. Start again.');
+      return ctx.scene.leave();
+    }
+    
+    // Start sending messages
+    const statusMsg = await ctx.reply(
+      `📤 **Sending Message to Self-Created Groups**\n\n` +
+      `**Account:** ${selectedAccounts[0].phone}\n` +
+      `**Message:** ${messageText.substring(0, 50)}...\n` +
+      `**Target:** Only groups you created (you're creator)\n` +
+      `**Status:** Checking your groups from Telegram...`
+    );
+    
+    try {
+      const account = new UserAccountManager(
+        selectedAccounts[0].phone,
+        selectedAccounts[0].api_id,
+        selectedAccounts[0].api_hash
+      );
+      account.session_string = selectedAccounts[0].session_string;
+      
+      // Get self-created groups
+      const groups = await account.getSelfCreatedGroups();
+      
+      if (!groups.length) {
+        await ctx.editMessageText(
+          `❌ No self-created groups found for account ${selectedAccounts[0].phone}.\n` +
+          `This account didn't create any groups or you're not the creator.\n\n` +
+          `Note: We only send to groups where you are the creator, not just admin.`
+        );
+        await account.disconnect();
+        return ctx.scene.leave();
+      }
+      
+      await ctx.editMessageText(
+        `📤 **Sending Message to Self-Created Groups**\n\n` +
+        `**Account:** ${selectedAccounts[0].phone}\n` +
+        `**Message:** ${messageText.substring(0, 50)}...\n` +
+        `**Target:** ${groups.length} groups (you're creator)\n` +
+        `**Status:** Sending messages...\n\n` +
+        `Progress: 0/${groups.length} (0%)`
+      );
+      
+      // Send messages
+      const results = await account.sendMessageToGroups(groups, messageText);
+      
+      const successCount = results.filter(r => r.success).length;
+      const failedCount = results.filter(r => !r.success).length;
+      
+      // Update account last used
+      await selectedAccounts[0].update({ last_used: new Date() });
+      
+      const successRate = groups.length > 0 ? (successCount / groups.length) * 100 : 0;
+      
+      const keyboard = [
+        [
+          Markup.button.callback('📱 List Accounts', 'list_accounts'),
+          Markup.button.callback('📤 Send Another', 'send_another')
+        ],
+        [Markup.button.callback('🏠 Main Menu', 'main_menu')]
+      ];
+      
+      await ctx.editMessageText(
+        `✅ **Message Sending Complete!**\n\n` +
+        `**Account:** ${selectedAccounts[0].phone}\n` +
+        `**Self-created groups found:** ${groups.length}\n` +
+        `**✅ Success:** ${successCount}\n` +
+        `**❌ Failed:** ${failedCount}\n` +
+        `**Success Rate:** ${successRate.toFixed(1)}%\n\n` +
+        `**Note:** Messages sent only to groups where you're the creator.\n\n` +
+        `**Message:** ${messageText.substring(0, 100)}...`,
+        Markup.inlineKeyboard(keyboard)
+      );
+      
+      await account.disconnect();
+    } catch (error) {
+      logger.error('Error sending messages:', error);
+      await ctx.editMessageText(`❌ **Failed to send messages**\n\nError: ${error.message}`);
+    }
+    
+    return ctx.scene.leave();
+  }
+});
+
+sendMessageScene.action('cancel_selection', async (ctx) => {
+  await ctx.answerCbQuery();
+  await ctx.editMessageText('❌ Operation cancelled.');
+  return ctx.scene.leave();
+});
+
+// Initialize bot
+const bot = new Telegraf(BOT_TOKEN);
+
+// Session middleware
+bot.use(session());
+bot.use(async (ctx, next) => {
+  // Store user info in session
+  if (ctx.from) {
+    ctx.session.userId = ctx.from.id;
+    ctx.session.username = ctx.from.username;
+    
+    // Register admin if applicable
+    if (ctx.from.username && ADMIN_USERNAMES.includes(ctx.from.username.toLowerCase())) {
+      ADMIN_USER_IDS.add(ctx.from.id);
+    }
+  }
+  await next();
+});
+
+// Stage for scenes
+const stage = new Stage([
+  addAccountScene,
+  createSingleScene,
+  createBulkScene,
+  createMultiScene,
+  sendMessageScene
+]);
+
+bot.use(stage.middleware());
+
+// Start command
+bot.start(async (ctx) => {
+  const userId = ctx.from.id;
+  const username = ctx.from.username;
+  
+  // Register admin if applicable
+  if (username && ADMIN_USERNAMES.includes(username.toLowerCase())) {
+    ADMIN_USER_IDS.add(userId);
+    logger.info(`Admin user registered: ${username} (ID: ${userId})`);
+  }
+  
+  const adminBadge = isAdmin(userId, username) ? ' 👑' : '';
+  
+  let message = `🤖 **Auto Group Creator Bot**${adminBadge}\n\n` +
+    `**Available commands:**\n` +
+    `/addaccount - Add Telegram user account\n` +
+    `/creategroup - Create single group (choose account)\n` +
+    `/createbulk - Create multiple groups (choose account)\n` +
+    `/createmulti - Create groups for multiple/all accounts\n` +
+    `/quickcreate - Quick single group (auto-select account)\n` +
+    `/listaccounts - List your accounts\n` +
+    `/cleanup - Cleanup old sessions\n` +
+    `/sendmessage - Send message to your self-created groups\n` +
+    `/stats - Show statistics\n` +
+    `/cancel - Cancel current operation\n`;
+  
+  if (isAdmin(userId, username)) {
+    message += `/admin - Admin panel\n\n`;
+  }
+  
+  message += `**Features:**\n` +
+    `• Create 50+ groups automatically\n` +
+    `• 5-second intervals between creations\n` +
+    `• Auto-generated group names\n` +
+    `• 'hello' welcome message\n` +
+    `• Open all permissions\n` +
+    `• Chat history visible\n` +
+    `• Account selection menu\n` +
+    `• NEW: Send messages to your self-created groups\n\n` +
+    `⚠️ **Note**: You need a Telegram user account (not bot) ` +
+    `with API credentials from https://my.telegram.org`;
+  
+  await ctx.reply(message);
+});
+
+// Quick create command
+bot.command('quickcreate', async (ctx) => {
+  const userId = ctx.from.id;
+  const username = getUsernameFromCtx(ctx);
+  
+  let account;
+  if (isAdmin(userId, username)) {
+    account = await UserAccount.findOne({
+      where: { is_active: true, is_banned: false },
+      order: [['last_used', 'ASC']]
+    });
+  } else {
+    account = await UserAccount.findOne({
+      where: { owner_user_id: userId, is_active: true, is_banned: false },
+      order: [['last_used', 'ASC']]
+    });
+  }
+  
+  if (!account) {
+    await ctx.reply(
+      '❌ No active accounts found.\n' +
+      'Use /addaccount to add a Telegram user account first.'
+    );
+    return;
+  }
+  
+  const groupName = generateGroupName();
+  
+  const statusMsg = await ctx.reply(
+    `⚡ **Quick Group Creation**\n\n` +
+    `**Account:** ${account.phone}\n` +
+    `**Group:** ${groupName}\n` +
+    `**Features:** 'hello' + Open permissions\n` +
+    `**Status:** Creating...`
+  );
+  
+  try {
+    const userAccount = new UserAccountManager(account.phone, account.api_id, account.api_hash);
+    userAccount.session_string = account.session_string;
+    
+    const result = await userAccount.createGroupWithFeatures(groupName);
+    
+    if (result.success) {
+      await account.update({ last_used: new Date() });
+      
+      const keyboard = [
+        [Markup.button.url('🔗 Open Group', result.invite_link)],
+        [Markup.button.callback('📋 Copy Link', `copy_${result.invite_link}`)],
+        [Markup.button.callback('🏠 Main Menu', 'main_menu')]
+      ];
+      
+      await ctx.telegram.editMessageText(
+        statusMsg.chat.id,
+        statusMsg.message_id,
+        null,
+        `✅ **Group Created Successfully!**\n\n` +
+        `**Name:** ${groupName}\n` +
+        `**ID:** ${result.chat_id}\n` +
+        `**Account:** ${account.phone}\n` +
+        `**Features:** ✅ 'hello' message + Open permissions`,
+        { reply_markup: Markup.inlineKeyboard(keyboard).reply_markup }
+      );
+    } else {
+      await ctx.telegram.editMessageText(
+        statusMsg.chat.id,
+        statusMsg.message_id,
+        null,
+        `❌ Failed to create group: ${result.error || 'Unknown error'}`
+      );
+    }
+    
+    await userAccount.disconnect();
+  } catch (error) {
+    await ctx.telegram.editMessageText(
+      statusMsg.chat.id,
+      statusMsg.message_id,
+      null,
+      `❌ Error: ${error.message}`
+    );
+  }
 });
 
 // List accounts command
 bot.command('listaccounts', async (ctx) => {
   const userId = ctx.from.id;
-  const username = ctx.from.username;
+  const username = getUsernameFromCtx(ctx);
   
-  try {
-    const accounts = await Account.find(
-      isAdmin(userId, username) 
-        ? { isActive: true, isBanned: false }
-        : { ownerUserId: userId, isActive: true, isBanned: false }
-    ).sort({ lastUsed: -1 });
+  let accounts;
+  if (isAdmin(userId, username)) {
+    accounts = await UserAccount.findAll({
+      order: [
+        ['owner_user_id', 'ASC'],
+        ['is_active', 'DESC'],
+        ['last_used', 'DESC']
+      ]
+    });
+  } else {
+    accounts = await UserAccount.findAll({
+      where: { owner_user_id: userId },
+      order: [
+        ['is_active', 'DESC'],
+        ['last_used', 'DESC']
+      ]
+    });
+  }
+  
+  if (!accounts.length) {
+    await ctx.reply('No accounts added yet. Use /addaccount');
+    return;
+  }
+  
+  let text;
+  if (isAdmin(userId, username)) {
+    text = '📱 **All User Accounts (Admin View)** 👑\n\n';
+    const accountsByOwner = {};
     
-    if (accounts.length === 0) {
-      return ctx.reply('📭 No accounts found. Use /addaccount to add one.');
+    for (const acc of accounts) {
+      const ownerId = acc.owner_user_id;
+      if (!accountsByOwner[ownerId]) {
+        accountsByOwner[ownerId] = [];
+      }
+      accountsByOwner[ownerId].push(acc);
     }
     
-    let message = isAdmin(userId, username) 
-      ? '📱 <b>All Accounts (Admin View)</b> 👑\n\n'
-      : '📱 <b>Your Accounts</b>\n\n';
-    
-    accounts.forEach((acc, i) => {
-      message += `${i + 1}. <b>${acc.phone}</b>\n`;
-      message += `   Status: ${acc.isActive ? '🟢 Active' : '🔴 Inactive'}\n`;
-      message += `   Last used: ${acc.lastUsed ? acc.lastUsed.toLocaleDateString() : 'Never'}\n`;
-      if (i < accounts.length - 1) message += '\n';
-    });
-    
-    await ctx.reply(message, { parse_mode: 'HTML' });
-  } catch (error) {
-    console.error('List accounts error:', error);
-    await ctx.reply('❌ Error loading accounts.');
+    for (const [ownerId, ownerAccounts] of Object.entries(accountsByOwner)) {
+      text += `👤 **User ID:** ${ownerId}\n`;
+      if (ownerAccounts[0].owner_username) {
+        text += `👤 **Username:** @${ownerAccounts[0].owner_username}\n`;
+      }
+      
+      for (const [i, acc] of ownerAccounts.entries()) {
+        const status = acc.is_active ? '🟢 Active' : '🔴 Inactive';
+        const banned = acc.is_banned ? '🚫 Banned' : '';
+        
+        text += `  ${i + 1}. **${acc.phone}**\n`;
+        text += `     Status: ${status} ${banned}\n`;
+        text += `     Last used: ${acc.last_used ? acc.last_used.toLocaleString() : 'Never'}\n`;
+        text += `     Added: ${acc.created_at.toLocaleDateString()}\n\n`;
+      }
+      
+      text += '\n';
+    }
+  } else {
+    text = '📱 **Your Accounts:**\n\n';
+    for (const [i, acc] of accounts.entries()) {
+      const status = acc.is_active ? '🟢 Active' : '🔴 Inactive';
+      const banned = acc.is_banned ? '🚫 Banned' : '';
+      
+      text += `**${i + 1}. ${acc.phone}**\n`;
+      text += `   Status: ${status} ${banned}\n`;
+      text += `   Last used: ${acc.last_used ? acc.last_used.toLocaleString() : 'Never'}\n`;
+      text += `   Added: ${acc.created_at.toLocaleDateString()}\n\n`;
+    }
   }
+  
+  await ctx.reply(text);
 });
 
-// Status command
-bot.command('status', async (ctx) => {
-  try {
-    const totalAccounts = await Account.countDocuments();
-    const activeAccounts = await Account.countDocuments({ isActive: true, isBanned: false });
-    
-    await ctx.reply(`
-📊 <b>Bot Status</b>
+// Stats command
+bot.command('stats', async (ctx) => {
+  const userId = ctx.from.id;
+  const username = getUsernameFromCtx(ctx);
+  
+  const totalAccounts = await UserAccount.count();
+  const activeAccounts = await UserAccount.count({ where: { is_active: true } });
+  const bannedAccounts = await UserAccount.count({ where: { is_banned: true } });
+  const uniqueUsers = await UserAccount.aggregate('owner_user_id', 'DISTINCT', { plain: false });
+  
+  const dayAgo = new Date(Date.now() - 24 * 60 * 60 * 1000);
+  const recentAccounts = await UserAccount.count({
+    where: {
+      last_used: {
+        [Sequelize.Op.gte]: dayAgo
+      }
+    }
+  });
+  
+  let text = '📊 **Bot Statistics**\n\n';
+  text += `**Total Accounts:** ${totalAccounts}\n`;
+  text += `**Active Accounts:** ${activeAccounts}\n`;
+  text += `**Banned Accounts:** ${bannedAccounts}\n`;
+  text += `**Unique Users:** ${uniqueUsers.length}\n`;
+  text += `**Active in last 24h:** ${recentAccounts}\n`;
+  
+  if (isAdmin(userId, username)) {
+    text += `\n**Admin Users:** ${ADMIN_USER_IDS.size}\n`;
+    text += `**Admin Usernames:** ${ADMIN_USERNAMES.map(u => '@' + u).join(', ')}\n`;
+  }
+  
+  await ctx.reply(text);
+});
 
-✅ Online 24/7
-🌐 Host: Render.com
-💾 Memory: ${Math.round(process.memoryUsage().heapUsed / 1024 / 1024)}MB
-⏰ Uptime: ${Math.floor(process.uptime() / 60)} minutes
-
-📈 <b>Statistics:</b>
-Total Accounts: ${totalAccounts}
-Active Accounts: ${activeAccounts}
-    `, { parse_mode: 'HTML' });
-  } catch (error) {
-    await ctx.reply('📊 Bot is online! Database statistics temporarily unavailable.');
+// Cleanup command
+bot.command('cleanup', async (ctx) => {
+  const userId = ctx.from.id;
+  const username = getUsernameFromCtx(ctx);
+  
+  const weekAgo = new Date(Date.now() - 7 * 24 * 60 * 60 * 1000);
+  
+  let whereClause;
+  if (isAdmin(userId, username)) {
+    whereClause = {
+      last_used: { [Sequelize.Op.lt]: weekAgo },
+      is_active: true
+    };
+  } else {
+    whereClause = {
+      owner_user_id: userId,
+      last_used: { [Sequelize.Op.lt]: weekAgo },
+      is_active: true
+    };
+  }
+  
+  const oldAccounts = await UserAccount.findAll({ where: whereClause });
+  const deactivated = oldAccounts.length;
+  
+  for (const account of oldAccounts) {
+    await account.update({ is_active: false });
+  }
+  
+  if (isAdmin(userId, username)) {
+    await ctx.reply(
+      `🧹 **Admin Cleanup Completed!** 👑\n` +
+      `Deactivated ${deactivated} inactive accounts (not used in 7 days).`
+    );
+  } else {
+    await ctx.reply(
+      `🧹 Cleanup completed!\n` +
+      `Deactivated ${deactivated} of your inactive accounts (not used in 7 days).`
+    );
   }
 });
 
 // Admin command
 bot.command('admin', async (ctx) => {
   const userId = ctx.from.id;
-  const username = ctx.from.username;
+  const username = getUsernameFromCtx(ctx);
   
   if (!isAdmin(userId, username)) {
-    return ctx.reply('❌ This command is only for administrators.');
+    await ctx.reply('❌ This command is only for administrators.');
+    return;
   }
   
-  const keyboard = Markup.inlineKeyboard([
+  const keyboard = [
     [Markup.button.callback('📊 System Stats', 'admin_stats')],
     [Markup.button.callback('👥 List All Users', 'admin_list_users')],
+    [Markup.button.callback('📱 List All Accounts', 'admin_list_all_accounts')],
+    [Markup.button.callback('🔄 Activate/Deactivate', 'admin_toggle_account')],
+    [Markup.button.callback('🚫 Ban/Unban Account', 'admin_ban_account')],
+    [Markup.button.callback('🗑️ Delete Account', 'admin_delete_account')],
     [Markup.button.callback('🏠 Main Menu', 'main_menu')]
-  ]);
+  ];
   
-  await ctx.reply(`
-👑 <b>Admin Panel</b>
-
-Welcome, ${ctx.from.first_name}!
-
-Select an option:
-  `, {
-    parse_mode: 'HTML',
-    ...keyboard
-  });
+  await ctx.reply(
+    '👑 **Admin Panel**\n\n' +
+    'Select an option:',
+    Markup.inlineKeyboard(keyboard)
+  );
 });
 
-// Handle callback queries
-bot.action('add_account', async (ctx) => {
-  await ctx.answerCbQuery();
-  await ctx.reply('Use /addaccount command to add a new account.');
+// Scene entry commands
+bot.command('addaccount', (ctx) => ctx.scene.enter('addAccount'));
+bot.command('creategroup', (ctx) => ctx.scene.enter('createSingle'));
+bot.command('sendmessage', (ctx) => ctx.scene.enter('sendMessage'));
+
+// Cancel command
+bot.command('cancel', async (ctx) => {
+  await clearUserSession(ctx.from.id);
+  await ctx.reply('❌ Operation cancelled.');
+  if (ctx.scene) {
+    await ctx.scene.leave();
+  }
 });
 
-bot.action('create_group', async (ctx) => {
+// Button handler
+bot.action(/copy_(.+)/, async (ctx) => {
   await ctx.answerCbQuery();
-  await ctx.reply('Use /creategroup command to create a new group.');
+  const link = ctx.match[1];
+  await ctx.editMessageText(
+    `📋 **Invite Link:**\n\n\`${link}\`\n\n` +
+    'Copy and share this link!'
+  );
 });
 
 bot.action('list_accounts', async (ctx) => {
   await ctx.answerCbQuery();
-  await ctx.reply('Use /listaccounts command to see your accounts.');
-});
-
-bot.action('show_stats', async (ctx) => {
-  await ctx.answerCbQuery();
+  // Simulate listaccounts command
   const userId = ctx.from.id;
+  const username = ctx.from.username;
   
-  try {
-    const accountCount = await Account.countDocuments({ ownerUserId: userId, isActive: true, isBanned: false });
-    const groupCount = await Group.countDocuments({ createdByUser: userId, isActive: true });
-    
-    await ctx.reply(`
-📊 <b>Your Statistics</b>
-
-📱 Accounts: ${accountCount}
-👥 Total Groups: ${groupCount}
-    `, { parse_mode: 'HTML' });
-  } catch (error) {
-    await ctx.reply('📊 Statistics temporarily unavailable.');
+  let accounts;
+  if (isAdmin(userId, username)) {
+    accounts = await UserAccount.findAll({
+      order: [
+        ['owner_user_id', 'ASC'],
+        ['is_active', 'DESC'],
+        ['last_used', 'DESC']
+      ]
+    });
+  } else {
+    accounts = await UserAccount.findAll({
+      where: { owner_user_id: userId },
+      order: [
+        ['is_active', 'DESC'],
+        ['last_used', 'DESC']
+      ]
+    });
   }
-});
-
-bot.action('admin_panel', async (ctx) => {
-  await ctx.answerCbQuery();
-  await ctx.reply('Use /admin command for admin panel.');
-});
-
-bot.action('admin_stats', async (ctx) => {
-  await ctx.answerCbQuery();
-  await ctx.reply('👑 Admin statistics coming soon...');
-});
-
-bot.action('admin_list_users', async (ctx) => {
-  await ctx.answerCbQuery();
   
-  try {
-    const users = await Account.aggregate([
-      {
-        $group: {
-          _id: '$ownerUserId',
-          username: { $first: '$ownerUsername' },
-          accountCount: { $sum: 1 },
-          activeCount: { $sum: { $cond: [{ $and: ['$isActive', { $not: '$isBanned' }] }, 1, 0] } }
-        }
-      },
-      { $sort: { accountCount: -1 } }
-    ]);
+  if (!accounts.length) {
+    await ctx.editMessageText('No accounts added yet. Use /addaccount');
+    return;
+  }
+  
+  let text;
+  if (isAdmin(userId, username)) {
+    text = '📱 **All User Accounts (Admin View)** 👑\n\n';
+    const accountsByOwner = {};
     
-    if (users.length === 0) {
-      return ctx.reply('No users found.');
+    for (const acc of accounts) {
+      const ownerId = acc.owner_user_id;
+      if (!accountsByOwner[ownerId]) {
+        accountsByOwner[ownerId] = [];
+      }
+      accountsByOwner[ownerId].push(acc);
     }
     
-    let message = '👥 <b>All Users</b> 👑\n\n';
-    
-    users.forEach((user, i) => {
-      message += `<b>User ID:</b> ${user._id}\n`;
-      if (user.username) {
-        message += `<b>Username:</b> @${user.username}\n`;
+    for (const [ownerId, ownerAccounts] of Object.entries(accountsByOwner)) {
+      text += `👤 **User ID:** ${ownerId}\n`;
+      if (ownerAccounts[0].owner_username) {
+        text += `👤 **Username:** @${ownerAccounts[0].owner_username}\n`;
       }
-      message += `<b>Accounts:</b> ${user.activeCount}/${user.accountCount} active\n`;
-      message += '─'.repeat(20) + '\n\n';
-    });
-    
-    await ctx.reply(message, { parse_mode: 'HTML' });
-  } catch (error) {
-    await ctx.reply('❌ Error loading users.');
+      
+      for (const [i, acc] of ownerAccounts.entries()) {
+        const status = acc.is_active ? '🟢 Active' : '🔴 Inactive';
+        const banned = acc.is_banned ? '🚫 Banned' : '';
+        
+        text += `  ${i + 1}. **${acc.phone}**\n`;
+        text += `     Status: ${status} ${banned}\n`;
+        text += `     Last used: ${acc.last_used ? acc.last_used.toLocaleString() : 'Never'}\n`;
+        text += `     Added: ${acc.created_at.toLocaleDateString()}\n\n`;
+      }
+      
+      text += '\n';
+    }
+  } else {
+    text = '📱 **Your Accounts:**\n\n';
+    for (const [i, acc] of accounts.entries()) {
+      const status = acc.is_active ? '🟢 Active' : '🔴 Inactive';
+      const banned = acc.is_banned ? '🚫 Banned' : '';
+      
+      text += `**${i + 1}. ${acc.phone}**\n`;
+      text += `   Status: ${status} ${banned}\n`;
+      text += `   Last used: ${acc.last_used ? acc.last_used.toLocaleString() : 'Never'}\n`;
+      text += `   Added: ${acc.created_at.toLocaleDateString()}\n\n`;
+    }
   }
+  
+  await ctx.editMessageText(text);
+});
+
+bot.action('create_another', async (ctx) => {
+  await ctx.answerCbQuery();
+  await ctx.editMessageText(
+    '🚀 **Create Another Group**\n\n' +
+    'Use the command: `/creategroup`'
+  );
+});
+
+bot.action('send_another', async (ctx) => {
+  await ctx.answerCbQuery();
+  await ctx.editMessageText(
+    '📤 **Send Another Message**\n\n' +
+    'Use the command: `/sendmessage`'
+  );
 });
 
 bot.action('main_menu', async (ctx) => {
   await ctx.answerCbQuery();
-  await ctx.editMessageText('🏠 <b>Main Menu</b>\n\nUse /start to see all commands.', {
-    parse_mode: 'HTML'
+  await ctx.editMessageText(
+    '🏠 **Main Menu**\n\n' +
+    'Use the command: `/start`'
+  );
+});
+
+bot.action('admin_stats', async (ctx) => {
+  await ctx.answerCbQuery();
+  const userId = ctx.from.id;
+  const username = ctx.from.username;
+  
+  if (!isAdmin(userId, username)) {
+    await ctx.answerCbQuery('Admin only!', { show_alert: true });
+    return;
+  }
+  
+  const totalAccounts = await UserAccount.count();
+  const activeAccounts = await UserAccount.count({ where: { is_active: true } });
+  const bannedAccounts = await UserAccount.count({ where: { is_banned: true } });
+  const uniqueUsers = await UserAccount.aggregate('owner_user_id', 'DISTINCT', { plain: false });
+  
+  const dayAgo = new Date(Date.now() - 24 * 60 * 60 * 1000);
+  const recentAccounts = await UserAccount.count({
+    where: {
+      last_used: {
+        [Sequelize.Op.gte]: dayAgo
+      }
+    }
   });
+  
+  let text = '📊 **Bot Statistics**\n\n';
+  text += `**Total Accounts:** ${totalAccounts}\n`;
+  text += `**Active Accounts:** ${activeAccounts}\n`;
+  text += `**Banned Accounts:** ${bannedAccounts}\n`;
+  text += `**Unique Users:** ${uniqueUsers.length}\n`;
+  text += `**Active in last 24h:** ${recentAccounts}\n`;
+  text += `\n**Admin Users:** ${ADMIN_USER_IDS.size}\n`;
+  text += `**Admin Usernames:** ${ADMIN_USERNAMES.map(u => '@' + u).join(', ')}\n`;
+  
+  await ctx.editMessageText(text);
 });
 
 // Error handling
 bot.catch((err, ctx) => {
-  console.error(`Error for ${ctx.updateType}:`, err);
-  ctx.reply('❌ An error occurred. Please try again.');
-});
-
-// ========== EXPRESS SERVER FOR 24/7 ==========
-// FIXED: No async operations in template string
-app.get('/', async (req, res) => {
-  try {
-    // Get stats safely
-    let userCount = 0;
-    let accountCount = 0;
-    let groupCount = 0;
-    
-    try {
-      userCount = await User.countDocuments() || 0;
-      accountCount = await Account.countDocuments() || 0;
-      groupCount = await Group.countDocuments() || 0;
-    } catch (dbError) {
-      console.log('Database stats temporarily unavailable');
-    }
-    
-    res.send(`
-      <!DOCTYPE html>
-      <html>
-      <head>
-        <title>Cretee Bot - Telegram Group Manager</title>
-        <meta name="viewport" content="width=device-width, initial-scale=1">
-        <style>
-          * { margin: 0; padding: 0; box-sizing: border-box; }
-          body { 
-            font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif; 
-            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
-            min-height: 100vh;
-            display: flex;
-            justify-content: center;
-            align-items: center;
-            padding: 20px;
-          }
-          .container { 
-            max-width: 800px; 
-            width: 100%;
-            background: white; 
-            padding: 40px; 
-            border-radius: 20px; 
-            box-shadow: 0 20px 60px rgba(0,0,0,0.3);
-            text-align: center;
-          }
-          h1 { 
-            color: #333; 
-            margin-bottom: 20px;
-            font-size: 2.5em;
-          }
-          .status { 
-            padding: 25px; 
-            border-radius: 15px; 
-            margin: 25px 0; 
-            background: #d4edda;
-            border-left: 5px solid #28a745;
-          }
-          .online h2 { 
-            color: #155724; 
-            margin-bottom: 10px;
-          }
-          .info { 
-            background: #d1ecf1; 
-            border-left: 5px solid #17a2b8;
-          }
-          .info h3 { 
-            color: #0c5460; 
-            margin-bottom: 15px;
-          }
-          .btn { 
-            display: inline-block; 
-            padding: 15px 30px; 
-            background: #007bff; 
-            color: white; 
-            text-decoration: none; 
-            border-radius: 50px; 
-            margin: 10px; 
-            font-weight: bold;
-            transition: all 0.3s ease;
-            border: none;
-            cursor: pointer;
-          }
-          .btn:hover { 
-            background: #0056b3; 
-            transform: translateY(-2px);
-            box-shadow: 0 5px 15px rgba(0,123,255,0.3);
-          }
-          .features { 
-            text-align: left; 
-            margin: 30px 0;
-            padding: 20px;
-            background: #f8f9fa;
-            border-radius: 10px;
-          }
-          .features li { 
-            margin: 10px 0; 
-            padding-left: 20px;
-            position: relative;
-          }
-          .features li:before {
-            content: "✓";
-            color: #28a745;
-            position: absolute;
-            left: 0;
-            font-weight: bold;
-          }
-        </style>
-      </head>
-      <body>
-        <div class="container">
-          <h1>🤖 Cretee Bot</h1>
-          <div class="status online">
-            <h2>✅ Bot Status: ONLINE 24/7</h2>
-            <p>Running on Render.com</p>
-          </div>
-          <div class="status info">
-            <h3>📊 Server Information</h3>
-            <p><strong>Uptime:</strong> ${Math.floor(process.uptime() / 3600)} hours</p>
-            <p><strong>Memory:</strong> ${(process.memoryUsage().heapUsed / 1024 / 1024).toFixed(2)} MB</p>
-            <p><strong>Node.js:</strong> ${process.version}</p>
-            <p><strong>Users:</strong> ${userCount}</p>
-            <p><strong>Accounts:</strong> ${accountCount}</p>
-            <p><strong>Groups Created:</strong> ${groupCount}</p>
-          </div>
-          
-          <a href="https://t.me/${process.env.BOT_TOKEN ? 'YourBotUsername' : 'cretee_bot'}" class="btn" target="_blank">
-            Open Telegram Bot
-          </a>
-          <a href="https://render.com" class="btn" target="_blank">
-            View Hosting
-          </a>
-          
-          <div class="features">
-            <h3>🚀 Features:</h3>
-            <ul>
-              <li>Multiple Telegram account management</li>
-              <li>Secure credential storage</li>
-              <li>24/7 uptime monitoring</li>
-              <li>Admin panel for management</li>
-              <li>Group creation (coming soon)</li>
-              <li>Bulk operations (coming soon)</li>
-            </ul>
-          </div>
-          
-          <h3>📖 How to Use:</h3>
-          <p>1. Open Telegram and search for the bot</p>
-          <p>2. Send /start to begin</p>
-          <p>3. Add your Telegram accounts via API</p>
-          <p>4. Manage your accounts</p>
-        </div>
-        
-        <script>
-          // Auto-refresh every 5 minutes to keep server alive
-          setTimeout(() => location.reload(), 300000);
-        </script>
-      </body>
-      </html>
-    `);
-  } catch (error) {
-    res.send(`
-      <html>
-        <body>
-          <h1>🤖 Cretee Bot</h1>
-          <p>✅ Bot is running...</p>
-          <p>Error loading stats: ${error.message}</p>
-        </body>
-      </html>
-    `);
+  logger.error(`Error for ${ctx.updateType}:`, err);
+  
+  if (ctx.message) {
+    ctx.reply('❌ An error occurred. Please try again.');
   }
 });
 
-// Health check endpoint for Render
-app.get('/health', (req, res) => {
-  res.status(200).json({
+// Health check endpoint
+const express = require('express');
+const app = express();
+const PORT = process.env.PORT || 3000;
+
+app.get('/', (req, res) => {
+  res.json({
     status: 'ok',
-    timestamp: new Date().toISOString(),
-    uptime: process.uptime(),
-    memory: process.memoryUsage(),
-    database: mongoose.connection.readyState === 1 ? 'connected' : 'disconnected'
+    service: 'Telegram Group Bot',
+    uptime: process.uptime()
   });
 });
 
-// ========== START BOT ==========
+app.get('/health', (req, res) => {
+  res.json({ status: 'healthy' });
+});
+
+// Start bot
 async function start() {
   try {
-    // Create directories
-    await createDirectories();
+    // Initialize database
+    await initDatabase();
     
-    // Connect to MongoDB
-    const mongoUri = process.env.MONGODB_URI || 'mongodb://localhost:27017/cretee_bot';
-    console.log('🔗 Connecting to MongoDB...');
-    
-    await mongoose.connect(mongoUri, {
-      useNewUrlParser: true,
-      useUnifiedTopology: true,
-    });
-    
-    console.log('✅ Connected to MongoDB');
-    
-    // Start web server
-    const PORT = process.env.PORT || 3000;
+    // Start web server for health checks
     app.listen(PORT, () => {
-      console.log(`🌐 Web server running on port ${PORT}`);
-      console.log(`🔗 Health check: http://localhost:${PORT}/health`);
-      console.log(`🔗 Main page: http://localhost:${PORT}/`);
+      logger.info(`Web server listening on port ${PORT}`);
     });
     
-    // Start bot
-    console.log('🤖 Starting Telegram bot...');
+    // Launch bot
     await bot.launch();
     
-    console.log('✅ Bot is running online!');
-    console.log(`👑 Admin users: ${ADMIN_USERNAMES.join(', ')}`);
-    console.log(`🚀 Bot ready for use`);
+    logger.info('🤖 Bot is running... Press Ctrl+C to stop');
+    logger.info(`📊 Database initialized successfully`);
+    logger.info(`👑 Admin users: ${ADMIN_USERNAMES.join(', ')}`);
+    logger.info(`🎯 Features Available:`);
+    logger.info(`   • Concurrent user handling`);
+    logger.info(`   • User account isolation`);
+    logger.info(`   • Admin controls for @${ADMIN_USERNAMES[0]}`);
+    logger.info(`   • Welcome message: 'hello'`);
+    logger.info(`   • Open all permissions`);
+    logger.info(`   • Blank group descriptions`);
+    logger.info(`   • 5-second intervals for bulk creation`);
+    logger.info(`   • Send messages to self-created groups (creator only)`);
     
-    // Graceful shutdown
-    process.once('SIGINT', () => {
-      console.log('🛑 Shutting down gracefully...');
-      bot.stop('SIGINT');
-      mongoose.disconnect();
-      process.exit(0);
-    });
-    
-    process.once('SIGTERM', () => {
-      console.log('🛑 Received SIGTERM, shutting down...');
-      bot.stop('SIGTERM');
-      mongoose.disconnect();
-      process.exit(0);
-    });
+    // Enable graceful stop
+    process.once('SIGINT', () => bot.stop('SIGINT'));
+    process.once('SIGTERM', () => bot.stop('SIGTERM'));
     
   } catch (error) {
-    console.error('❌ Failed to start:', error);
-    console.log('Trying to continue without database...');
-    
-    // Start web server even without DB
-    const PORT = process.env.PORT || 3000;
-    app.listen(PORT, () => {
-      console.log(`🌐 Web server running on port ${PORT} (no DB)`);
-    });
-    
-    // Start bot without DB
-    try {
-      await bot.launch();
-      console.log('✅ Bot running (without database)');
-    } catch (botError) {
-      console.error('❌ Bot failed:', botError.message);
-    }
+    logger.error('Failed to start bot:', error);
+    process.exit(1);
   }
 }
 
-// Handle unhandled rejections
-process.on('unhandledRejection', (error) => {
-  console.error('Unhandled rejection:', error.message);
-});
-
-process.on('uncaughtException', (error) => {
-  console.error('Uncaught exception:', error.message);
-});
-
 // Start the application
-start();
+if (require.main === module) {
+  start();
+}
+
+module.exports = {
+  bot,
+  start,
+  UserAccount,
+  CreatedGroup,
+  UserAccountManager
+};
